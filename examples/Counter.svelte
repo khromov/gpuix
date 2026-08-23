@@ -43,7 +43,7 @@
 			{count}
 		</div>
 
-		<div style="color: #a6adc8; font-size: 14px">123 Click the number or + to increment</div>
+		<div style="color: #a6adc8; font-size: 14px">Click the number or + to increment</div>
 
 		<div style="display: flex; flex-direction: row; gap: 12px">
 			<div
