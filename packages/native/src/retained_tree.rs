@@ -10,6 +10,17 @@ use std::collections::{HashMap, HashSet};
 
 use crate::style::StyleDesc;
 
+/// Element type for ordering-only nodes.
+///
+/// Frameworks that compile templates rather than diff a virtual tree — Svelte,
+/// Vue, Solid — place marker nodes to remember where a `{#if}` branch or a keyed
+/// list item belongs. Those markers must hold a position among their siblings so
+/// `insert_before` has something to aim at, but they paint nothing.
+///
+/// They are stored as ordinary children so ordering and reparenting need no
+/// special cases; only the build pass skips them.
+pub const ANCHOR: &str = "anchor";
+
 pub struct RetainedElement {
     pub id: u64,
     pub element_type: String,
@@ -62,6 +73,23 @@ impl RetainedTree {
             root_id: None,
             next_revision: 1,
         }
+    }
+
+    /// False for missing elements and for anchors, which never paint.
+    pub fn is_renderable(&self, id: u64) -> bool {
+        self.elements
+            .get(&id)
+            .is_some_and(|element| element.element_type != ANCHOR)
+    }
+
+    /// Children that actually paint, in order, skipping anchors.
+    pub fn renderable_children(&self, element: &RetainedElement) -> Vec<u64> {
+        element
+            .children
+            .iter()
+            .copied()
+            .filter(|child_id| self.is_renderable(*child_id))
+            .collect()
     }
 
     pub fn create_element(&mut self, id: u64, element_type: String) {
@@ -183,6 +211,24 @@ impl RetainedTree {
     pub fn set_text(&mut self, id: u64, content: String) {
         let mut changed = false;
         if let Some(element) = self.elements.get_mut(&id) {
+            // An anchor that gains content becomes a text node, and a childless
+            // text node that loses all of it becomes an anchor again.
+            //
+            // Frameworks create empty text nodes as placeholders and fill them
+            // in later. Without this swap each one would occupy a slot in its
+            // parent's flex layout — picking up the parent's `gap` — while
+            // painting nothing. Only these two types are ever swapped, so
+            // `div` and the custom elements are untouched, and requiring no
+            // children keeps `<text>` wrappers from being demoted out of view.
+            let blank = content.trim().is_empty();
+            if element.element_type == ANCHOR && !blank {
+                element.element_type = String::from("text");
+                changed = true;
+            } else if element.element_type == "text" && blank && element.children.is_empty() {
+                element.element_type = String::from(ANCHOR);
+                changed = true;
+            }
+
             if element.content.as_ref() != Some(&content) {
                 element.content = Some(content);
                 changed = true;
