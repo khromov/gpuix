@@ -844,8 +844,11 @@ impl TestGpuixRenderer {
 
     fn collect_text(id: u64, tree: &RetainedTree, texts: &mut Vec<String>) {
         if let Some(element) = tree.elements.get(&id) {
+            // Anchors never paint, so their content is not part of the UI's text.
             if let Some(ref content) = element.content {
-                texts.push(content.clone());
+                if element.element_type != crate::retained_tree::ANCHOR {
+                    texts.push(content.clone());
+                }
             }
             for &child_id in &element.children {
                 Self::collect_text(child_id, tree, texts);

@@ -2,23 +2,24 @@
  * Svelte custom renderer targeting Zed's GPUI.
  *
  * Svelte's renderer contract is DOM-shaped: fragments, comments, text nodes,
- * parent/sibling walking. GPUI's tree is flat, id-based, and knows only `div`,
- * `text` and its custom element types. Neither comments nor fragments have any
- * GPUI representation, and Svelte creates a lot of both — every `{#if}`,
- * `{#each}` and component boundary leaves anchor nodes behind.
+ * parent/sibling walking. GPUI is flat and id-based. The shadow tree here
+ * exists because Svelte reads the tree synchronously *while it is still
+ * mutating it* — `from_tree` creates nodes and `$.child()`/`$.sibling()` walk
+ * them immediately — so those reads have to be answered locally rather than
+ * across the FFI boundary, which would defeat mutation batching.
  *
- * So this module keeps a JS shadow tree and *projects* it onto GPUI:
+ * The projection itself is nearly 1:1, because GPUI understands anchors:
  *
- *   - Elements and non-blank text nodes get a `nativeId`.
- *   - Comments, blank text nodes and fragments never do. They are ordering-only.
- *   - Native ids are allocated lazily, when a node first becomes reachable from
- *     the root. Svelte renders offscreen constantly (the shared each-block
- *     fragment, deferred `{#if}` branches, `<svelte:boundary>` pending content),
- *     and eager creation would leak a Rust node for every abandoned render.
+ *   - Comments become native `anchor` elements. They hold a position among
+ *     their siblings and paint nothing, so `insertBefore` can aim at them.
+ *   - Text nodes are created as `text`; GPUI swaps a childless one to `anchor`
+ *     whenever its content is blank, which is how Svelte's empty placeholder
+ *     text nodes stay out of the parent's flex layout.
+ *   - Fragments are the one thing GPUI has no notion of, so they stay JS-only
+ *     and splat their children into the parent on insert.
  *
- * Because virtual nodes are always leaves, "the next native node" is a flat
- * scan of following siblings — a native node can never hide beneath a virtual
- * one, so there is nothing to descend into.
+ * Every node therefore has a native id from creation, and `insert` maps
+ * straight onto `insertBefore`/`appendChild` with no anchor resolution.
  */
 
 import { createRenderer } from 'svelte/renderer';
@@ -29,6 +30,7 @@ import { to_gpui_event } from './events.js';
 const GPUI_TAGS = new Set([
 	'div',
 	'text',
+	'anchor',
 	'img',
 	'svg',
 	'canvas',
@@ -97,10 +99,6 @@ function node(kind, name, data) {
 		attrs: /** @type {Record<string, any>} */ ({}),
 		listeners: /** @type {Map<string, any[]>} */ (new Map()),
 		nativeId: /** @type {number | null} */ (null),
-		/** reachable from the designated GPUI root */
-		live: false,
-		/** currently appended to its native parent */
-		attached: false,
 		parent: null,
 		first: null,
 		last: null,
@@ -146,25 +144,6 @@ function unlink(child) {
 // projection
 // ---------------------------------------------------------------------------
 
-const is_blank = (s) => s == null || s.trim() === '';
-
-/**
- * Fragments are never children (every insert splats them), so a fragment parent
- * means "not attached to anything native yet".
- */
-const native_parent_of = (parent) => (parent && parent.kind === 'element' ? parent : null);
-
-/**
- * The GPUI node that `node` must be inserted before, or null to append.
- * Siblings only — never descend, never ascend.
- */
-function first_native_after(cursor) {
-	for (let n = cursor; n !== null; n = n.next) {
-		if (n.nativeId !== null && n.attached) return n;
-	}
-	return null;
-}
-
 function map_tag(name) {
 	if (GPUI_TAGS.has(name)) return name;
 	if (!warned_tags.has(name)) {
@@ -195,66 +174,33 @@ function apply_prop(el, key, value) {
 	emit(['setCustomPropValue', el.nativeId, name, value === null ? null : normalize_prop(name, value)]);
 }
 
-/** Give `node` (and everything below it) a native presence. Idempotent. */
-function materialize(n) {
-	if (n.kind === 'comment' || n.kind === 'fragment') return;
+/**
+ * Give a node its native counterpart. Called at creation, so every node has an
+ * id before it can ever be used as an insertion anchor.
+ *
+ * Fragments are the exception: GPUI has no fragment, and `insert` splats them.
+ */
+function create_native(n) {
+	if (n.kind === 'fragment') return;
 
-	if (n.nativeId === null) {
-		if (n.kind === 'text') {
-			// Blank text is an anchor, not content — leave it virtual so it
-			// doesn't occupy a slot in GPUI's flex layout.
-			if (is_blank(n.data)) return;
+	n.nativeId = ++next_id;
+	by_id.set(n.nativeId, n);
 
-			n.nativeId = ++next_id;
-			by_id.set(n.nativeId, n);
-			emit(['createElement', n.nativeId, 'text']);
-			emit(['setText', n.nativeId, n.data]);
-			return; // text nodes have no children
-		}
-
-		n.nativeId = ++next_id;
-		by_id.set(n.nativeId, n);
-		emit(['createElement', n.nativeId, map_tag(n.name)]);
-
-		if (Object.keys(n.attrs).length > 0) {
-			apply_style(n);
-			for (const key of Object.keys(n.attrs)) {
-				if (STYLE_ATTRS.has(key) || key === 'class') continue;
-				apply_prop(n, key, n.attrs[key]);
-			}
-		}
-
-		for (const type of n.listeners.keys()) {
-			emit(['setEventListener', n.nativeId, type, true]);
-		}
+	if (n.kind === 'comment') {
+		// Anchors paint nothing; the comment's data stays in the shadow tree.
+		emit(['createElement', n.nativeId, 'anchor']);
+		return;
 	}
 
-	for (let c = n.first; c; c = c.next) {
-		materialize(c);
-		if (c.nativeId !== null && !c.attached) attach(c);
+	if (n.kind === 'text') {
+		emit(['createElement', n.nativeId, 'text']);
+		// GPUI demotes a childless text node to an anchor while this is blank,
+		// which keeps Svelte's placeholder text out of the flex layout.
+		emit(['setText', n.nativeId, n.data]);
+		return;
 	}
-}
 
-/** Put an already-materialized node in its correct native slot. */
-function attach(n) {
-	if (n.nativeId === null) return;
-
-	const np = native_parent_of(n.parent);
-	if (np === null || np.nativeId === null) return;
-
-	const before = first_native_after(n.next);
-	emit(
-		before
-			? ['insertBefore', np.nativeId, n.nativeId, before.nativeId]
-			: ['appendChild', np.nativeId, n.nativeId]
-	);
-	n.attached = true;
-}
-
-function set_live(n, value) {
-	if (n.live === value) return;
-	n.live = value;
-	for (let c = n.first; c; c = c.next) set_live(c, value);
+	emit(['createElement', n.nativeId, map_tag(n.name)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -263,9 +209,24 @@ function set_live(n, value) {
 
 const renderer = createRenderer({
 	createFragment: () => node('fragment', '', ''),
-	createElement: (name) => node('element', name, ''),
-	createTextNode: (data) => node('text', '', data),
-	createComment: (data) => node('comment', '', data),
+
+	createElement(name) {
+		const n = node('element', name, '');
+		create_native(n);
+		return n;
+	},
+
+	createTextNode(data) {
+		const n = node('text', '', data);
+		create_native(n);
+		return n;
+	},
+
+	createComment(data) {
+		const n = node('comment', '', data);
+		create_native(n);
+		return n;
+	},
 
 	nodeType: (n) => n.kind,
 
@@ -307,22 +268,13 @@ const renderer = createRenderer({
 	hasAttribute: (el, name) => name in el.attrs,
 
 	setText(n, text) {
-		if (n.kind === 'comment') {
-			n.data = text;
-			return;
-		}
-
 		n.data = text;
 
-		if (n.nativeId !== null) {
-			emit(['setText', n.nativeId, text]);
-			return;
-		}
+		// A comment is an anchor: forwarding its data would promote it to a
+		// text node in GPUI and make it paint.
+		if (n.kind === 'comment') return;
 
-		// A blank anchor that just gained content becomes a real GPUI text node.
-		if (n.kind !== 'text' || is_blank(text) || !n.live) return;
-		materialize(n);
-		attach(n);
+		if (n.nativeId !== null) emit(['setText', n.nativeId, text]);
 	},
 
 	getFirstChild: (n) => n.first,
@@ -341,38 +293,33 @@ const renderer = createRenderer({
 			return;
 		}
 
-		const was_live = n.live;
-		const old_parent = was_live ? native_parent_of(n.parent) : null;
-
 		if (n.parent) unlink(n); // insert doubles as move
 		link(parent, n, anchor);
 
 		pending_destroy.delete(n); // resurrected before the next commit
 
-		set_live(n, parent.live === true);
+		// A fragment parent has no native counterpart; its children get attached
+		// when the fragment itself is splatted into a real parent.
+		if (parent.nativeId === null) return;
 
-		if (n.live) {
-			materialize(n);
-			attach(n); // GPUI reparents on insertBefore/appendChild
-		} else if (was_live && n.attached && old_parent && old_parent.nativeId !== null) {
-			// moved out of the live tree, into an offscreen fragment
-			emit(['removeChild', old_parent.nativeId, n.nativeId]);
-			n.attached = false;
-		}
+		// GPUI reparents on insertBefore/appendChild, so a move is one op.
+		emit(
+			anchor
+				? ['insertBefore', parent.nativeId, n.nativeId, anchor.nativeId]
+				: ['appendChild', parent.nativeId, n.nativeId]
+		);
 	},
 
 	remove(n) {
 		if (n.parent === null) return;
 
-		const np = n.live ? native_parent_of(n.parent) : null;
+		const parent = n.parent;
 		unlink(n);
 
-		if (n.nativeId !== null && n.attached && np && np.nativeId !== null) {
-			emit(['removeChild', np.nativeId, n.nativeId]);
+		if (parent.nativeId !== null && n.nativeId !== null) {
+			emit(['removeChild', parent.nativeId, n.nativeId]);
 		}
-		n.attached = false;
 
-		set_live(n, false);
 		// Never destroy here — Svelte removes and re-inserts the same node in
 		// consecutive statements (see `each.js`'s controlled-anchor reset).
 		pending_destroy.add(n);
@@ -432,12 +379,8 @@ export function set_native(instance) {
 /** Create the single GPUI root element and return its shadow node. */
 export function create_root(style = { display: 'flex', width: '100%', height: '100%' }) {
 	const root = node('element', 'div', '');
-	root.nativeId = ++next_id;
-	root.live = true;
-	root.attached = true;
-	by_id.set(root.nativeId, root);
+	create_native(root);
 
-	emit(['createElement', root.nativeId, 'div']);
 	emit(['setStyle', root.nativeId, style]);
 	emit(['setRoot', root.nativeId]);
 
@@ -472,7 +415,6 @@ export function commit() {
 		const n = by_id.get(id);
 		if (n) {
 			n.nativeId = null;
-			n.attached = false;
 			n.listeners.clear();
 		}
 		by_id.delete(id);

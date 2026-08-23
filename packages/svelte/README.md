@@ -30,6 +30,9 @@ render_hot(new URL('./Counter.svelte', import.meta.url), {
 cd examples && bun run counter-svelte
 ```
 
+> **Requires the anchor-aware native addon.** This package depends on the `anchor` element
+> type in `@gpuix/native`; build it from this branch (`cd packages/native && bun run build`).
+
 ## Setup
 
 This package depends on an unreleased Svelte branch (`custom-condition`), checked out as a sibling of
@@ -66,30 +69,36 @@ from a terminal, and Preview.app reloads on write.
 
 ## How it works
 
-GPUI's tree is flat and id-based, and knows only `div`, `text` and its custom element types. Svelte's
-tree is DOM-shaped and full of **anchor nodes** — comments and empty text nodes marking every
-`{#if}`, `{#each}` and component boundary — plus fragments. None of those exist in GPUI.
+Svelte's renderer contract is DOM-shaped: fragments, comments, text nodes,
+parent/sibling walking. GPUI is flat and id-based. Two things bridge that.
 
-So `src/renderer.js` keeps a **JS shadow tree** and projects it onto GPUI:
+**GPUI understands anchors.** `RetainedTree` has an `anchor` element type: a node that
+holds a position among its siblings and paints nothing. Frameworks that compile templates
+rather than diff a virtual tree — Svelte, Vue, Solid — all place marker nodes to remember
+where an `{#if}` branch or a keyed list item belongs, and they all need somewhere to put
+them. So `insert_before` can aim at a marker, and only the build pass skips it.
 
 | Svelte node | GPUI |
 |---|---|
 | element | `createElement(id, tag)` |
-| text with content | `createElement(id, 'text')` + `setText` |
-| text that is empty or whitespace-only | *nothing* — materialized if it later gains content |
-| comment | *nothing, ever* |
-| fragment | splatted into the parent on insert |
+| text | `createElement(id, 'text')` — GPUI swaps a childless one to `anchor` while its content is blank |
+| comment | `createElement(id, 'anchor')` |
+| fragment | nothing — JS-only, splatted into the parent on insert |
 
-Three properties make this tractable:
+Every node therefore has a native id from creation, and `insert` maps straight onto
+`insertBefore`/`appendChild` with no anchor resolution in JS. The blank-text swap is what
+keeps Svelte's placeholder text nodes — the `' '` every `{expr}` starts life as — out of
+the parent's flex layout, where they would otherwise each pick up its `gap`.
 
-- **Virtual nodes are always leaves**, so "the next native node" is a flat scan of following
-  siblings. A native node can never hide beneath a virtual one.
-- **Native ids are allocated lazily**, when a node first becomes reachable from the root. Svelte
-  renders offscreen constantly (the shared each-block fragment, deferred `{#if}` branches,
-  `<svelte:boundary>` pending content); eager creation would leak a Rust node per abandoned render.
-- **`remove()` never destroys.** Svelte removes and re-inserts the same node in consecutive
-  statements, so removal only detaches and enqueues; `destroyElement` runs at commit time for nodes
-  that are still detached.
+**A JS shadow tree, for reads.** Svelte reads the tree synchronously *while it is still
+mutating it*: `from_tree` creates nodes and `$.child()`/`$.sibling()` walk them
+immediately. Answering those across the FFI boundary would force the pending write batch
+to flush before every read, which is precisely what the batching exists to avoid. So the
+shadow tree stays, and answers structural queries locally.
+
+One rule survives from the tree bookkeeping: **`remove()` never destroys.** Svelte removes
+and re-inserts the same node in consecutive statements, so removal only detaches and
+enqueues; `destroyElement` runs at commit for nodes still detached.
 
 Mutations queue up and ship as a single `applyBatch` call, committed before each `tick()` and
 immediately after each event.

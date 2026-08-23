@@ -1292,8 +1292,11 @@ impl GpuixRenderer {
 
 fn collect_text(id: u64, tree: &RetainedTree, texts: &mut Vec<String>) {
     if let Some(element) = tree.elements.get(&id) {
+        // Anchors never paint, so their content is not part of the UI's text.
         if let Some(ref content) = element.content {
-            texts.push(content.clone());
+            if element.element_type != crate::retained_tree::ANCHOR {
+                texts.push(content.clone());
+            }
         }
         for &child_id in &element.children {
             collect_text(child_id, tree, texts);
@@ -1925,6 +1928,13 @@ pub(crate) fn build_element(
         return gpui::Empty.into_any_element();
     };
 
+    // Anchors hold a position among their siblings and paint nothing. Parents
+    // filter them out of their child lists; this guards the direct-build path
+    // (a stray `set_root` at an anchor, say).
+    if element.element_type == crate::retained_tree::ANCHOR {
+        return gpui::Empty.into_any_element();
+    }
+
     let animated_style = if let Some(source) = element.custom_props.get("motion") {
         let state = match ctx.motion_states.entry(id) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -1979,7 +1989,7 @@ pub(crate) fn build_element(
                 .children
                 .iter()
                 .copied()
-                .filter(|child_id| ctx.tree.elements.contains_key(child_id))
+                .filter(|child_id| ctx.tree.is_renderable(*child_id))
                 .collect();
             let custom_children: Vec<gpui::AnyElement> = child_ids
                 .into_iter()
@@ -2063,7 +2073,7 @@ fn build_virtual_list(
         .children
         .iter()
         .copied()
-        .filter(|child_id| ctx.tree.elements.contains_key(child_id))
+        .filter(|child_id| ctx.tree.is_renderable(*child_id))
         .collect();
     let child_revisions: Vec<u64> = child_ids
         .iter()
@@ -2477,7 +2487,7 @@ pub(crate) fn build_div(
     }
 
     // Children
-    let child_ids: Vec<u64> = element.children.clone();
+    let child_ids: Vec<u64> = ctx.tree.renderable_children(element);
     for child_id in child_ids {
         let child = build_element(child_id, ctx, window, cx);
         el = if overflow_x_only {
@@ -2519,7 +2529,7 @@ pub(crate) fn build_text(
     // Fast path: plain text leaf without style. It still goes through
     // `text_content` so the glyphs land in the selection registry — the old
     // raw-string return was the reason text was not selectable.
-    if style.is_none() && element.children.is_empty() {
+    if style.is_none() && ctx.tree.renderable_children(element).is_empty() {
         let content = element.content.clone().unwrap_or_default();
         return gpui::div()
             .relative()
@@ -2544,7 +2554,7 @@ pub(crate) fn build_text(
         el = el.child(text_content(element.id, content, ctx));
     }
 
-    let child_ids: Vec<u64> = element.children.clone();
+    let child_ids: Vec<u64> = ctx.tree.renderable_children(element);
     for child_id in child_ids {
         el = el.child(build_element(child_id, ctx, window, cx));
     }
