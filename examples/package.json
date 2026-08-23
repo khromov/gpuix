@@ -8,7 +8,8 @@
     "test": "vitest run",
     "native-text": "bun --hot native-text.tsx",
     "chat": "bun --hot chat.tsx",
-    "compile": "bun compile-chat.ts"
+    "compile": "bun compile-chat.ts",
+    "counter-svelte": "bun --conditions custom-renderer --conditions development counter-svelte.js"
   },
   "dependencies": {
     "@gpuix/react": "workspace:*",
@@ -16,7 +17,8 @@
     "diff": "^7.0.0",
     "react": "^19.2.4",
     "safe-mdx": "1.14.0",
-    "shiki": "^3.0.0"
+    "shiki": "^3.0.0",
+    "@gpuix/svelte": "workspace:*"
   },
   "devDependencies": {
     "@types/mdast": "^4.0.4",

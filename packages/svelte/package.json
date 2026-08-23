@@ -1,0 +1,16 @@
+{
+  "name": "@gpuix/svelte",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./renderer": "./src/renderer.js",
+    "./plugin": "./src/plugin.js"
+  },
+  "dependencies": {
+    "@gpuix/native": "workspace:^",
+    "svelte": "file:../../../svelte/packages/svelte"
+  }
+}

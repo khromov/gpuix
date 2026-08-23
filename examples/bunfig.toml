@@ -1,0 +1,2 @@
+# Compiles .svelte files on import (and on save, under `bun --hot`).
+preload = ["../packages/svelte/src/plugin.js"]
