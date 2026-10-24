@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::sync::OnceLock;
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -812,34 +812,234 @@ impl Loader for FsLoader {
 
 // ── Globals ──────────────────────────────────────────────────────────────
 
-const PRELUDE: &str = r#"
-(() => {
-	const exit = globalThis.__gpuix_exit;
-	const write = globalThis.__gpuix_write;
-	const info = globalThis.__gpuix_process;
-	delete globalThis.__gpuix_exit;
-	delete globalThis.__gpuix_write;
-	delete globalThis.__gpuix_process;
-	const stream = (fd) => ({ write(chunk) { write(fd, String(chunk)); return true; }, isTTY: false });
-	globalThis.process = {
-		...info,
-		exit: (code = 0) => exit(code | 0),
-		cwd: () => info.cwd,
-		stdout: stream(1),
-		stderr: stream(2),
-		on() { return this; },
-		off() { return this; },
-		once() { return this; },
-		nextTick: (fn, ...args) => queueMicrotask(() => fn(...args))
-	};
-	if (typeof globalThis.queueMicrotask !== 'function') {
-		globalThis.queueMicrotask = (fn) => { Promise.resolve().then(fn); };
-	}
-	if (typeof globalThis.structuredClone !== 'function') {
-		globalThis.structuredClone = (value) => JSON.parse(JSON.stringify(value));
-	}
-})();
-"#;
+/// The JS half of the globals: everything below the natives (`process`, text
+/// coding, `URL`, `fetch` and its classes) is written once, in JS.
+const PRELUDE: &str = include_str!("prelude.js");
+
+// ── Promises settled from other threads ──────────────────────────────────
+//
+// `fetch` answers on a background thread. The thread parks the outcome here
+// and the main loop settles the JS promise on its next turn, the same shape as
+// `promptForPaths`. The one completion so far is a fetched response, whose body
+// becomes a Uint8Array.
+
+enum Completion {
+    Fetched {
+        status: u16,
+        status_text: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+}
+
+type Settler = (Persistent<Function<'static>>, Persistent<Function<'static>>);
+
+static COMPLETIONS: Mutex<Vec<(u64, std::result::Result<Completion, String>)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static SETTLERS: RefCell<HashMap<u64, Settler>> = RefCell::new(HashMap::new());
+    static NEXT_SETTLER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A new promise whose resolve/reject wait for a completion under the returned id.
+fn deferred<'js>(ctx: &Ctx<'js>) -> Result<(u64, Promise<'js>)> {
+    let (promise, resolve, reject) = ctx.promise()?;
+    let id = NEXT_SETTLER.with(|next| {
+        let id = next.get() + 1;
+        next.set(id);
+        id
+    });
+    SETTLERS.with(|settlers| {
+        settlers
+            .borrow_mut()
+            .insert(id, (Persistent::save(ctx, resolve), Persistent::save(ctx, reject)))
+    });
+    Ok((id, promise))
+}
+
+/// What wakes the main loop while it waits: stdin's `reload` line, stdin closing,
+/// or a background thread finishing a completion.
+enum Wake {
+    Reload,
+    StdinClosed,
+    Completion,
+}
+
+static WAKER: OnceLock<mpsc::Sender<Wake>> = OnceLock::new();
+
+fn complete(id: u64, result: std::result::Result<Completion, String>) {
+    COMPLETIONS.lock().unwrap().push((id, result));
+    if let Some(waker) = WAKER.get() {
+        let _ = waker.send(Wake::Completion);
+    }
+}
+
+fn completions_pending() -> bool {
+    !COMPLETIONS.lock().unwrap().is_empty()
+}
+
+fn settlers_waiting() -> bool {
+    SETTLERS.with(|settlers| !settlers.borrow().is_empty())
+}
+
+fn settle_completions(ctx: &Ctx<'_>) {
+    let completions: Vec<_> = std::mem::take(&mut *COMPLETIONS.lock().unwrap());
+    for (id, result) in completions {
+        let Some((resolve, reject)) = SETTLERS.with(|settlers| settlers.borrow_mut().remove(&id)) else { continue };
+        let outcome = (|| -> Result<()> {
+            match result {
+                Ok(Completion::Fetched { status, status_text, url, headers, body }) => {
+                    let object = Object::new(ctx.clone())?;
+                    object.set("status", status)?;
+                    object.set("statusText", status_text)?;
+                    object.set("url", url)?;
+                    let pairs: Vec<Vec<String>> = headers.into_iter().map(|(name, value)| vec![name, value]).collect();
+                    object.set("headers", pairs)?;
+                    object.set("body", TypedArray::<u8>::new(ctx.clone(), body)?)?;
+                    resolve.restore(ctx)?.call::<_, ()>((object,))
+                }
+                Err(reason) => {
+                    let error = Exception::from_message(ctx.clone(), &reason)?;
+                    reject.restore(ctx)?.call::<_, ()>((error,))
+                }
+            }
+        })();
+        if let Err(error) = outcome {
+            report(ctx, error, "settling a promise threw");
+        }
+        drain_jobs(ctx);
+    }
+}
+
+// ── fetch, URL and UTF-8, the natives behind prelude.js ──────────────────
+
+fn http_client() -> std::result::Result<&'static reqwest_client::ReqwestClient, String> {
+    static CLIENT: OnceLock<std::result::Result<reqwest_client::ReqwestClient, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| reqwest_client::ReqwestClient::user_agent("gpuix-qjs").map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+#[derive(serde::Deserialize)]
+struct FetchInit {
+    method: String,
+    headers: Vec<(String, String)>,
+}
+
+/// `__gpuix_fetch(url, initJson, body?)`: one request on its own thread through
+/// the client gpuix-native already links; the whole body is read before the
+/// promise settles.
+fn fetch<'js>(ctx: Ctx<'js>, url: String, init: String, body: Opt<Value<'js>>) -> Result<Promise<'js>> {
+    use futures::AsyncReadExt as _;
+    use http_client::HttpClient as _;
+
+    let init: FetchInit = serde_json::from_str(&init).map_err(|error| Exception::throw_type(&ctx, &error.to_string()))?;
+    let body = match body.0 {
+        Some(value) if !value.is_undefined() && !value.is_null() => Some(bytes(&ctx, value)?),
+        _ => None,
+    };
+    let (id, promise) = deferred(&ctx)?;
+
+    std::thread::spawn(move || {
+        let outcome = (|| -> std::result::Result<Completion, String> {
+            let client = http_client()?;
+            let mut request = http_client::Request::builder().method(init.method.as_str()).uri(&url);
+            for (name, value) in &init.headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            let request = request
+                .body(match body {
+                    Some(bytes) => http_client::AsyncBody::from(bytes),
+                    None => http_client::AsyncBody::empty(),
+                })
+                .map_err(|error| error.to_string())?;
+            let response = futures::executor::block_on(client.send(request)).map_err(|error| format!("{error:#}"))?;
+            let status = response.status();
+            let headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str().to_string(), String::from_utf8_lossy(value.as_bytes()).into_owned()))
+                .collect();
+            let mut bytes = Vec::new();
+            futures::executor::block_on(response.into_body().read_to_end(&mut bytes)).map_err(|error| error.to_string())?;
+            Ok(Completion::Fetched {
+                status: status.as_u16(),
+                status_text: status.canonical_reason().unwrap_or("").to_string(),
+                url,
+                headers,
+                body: bytes,
+            })
+        })();
+        complete(id, outcome.map_err(|reason| format!("fetch failed: {reason}")));
+    });
+    Ok(promise)
+}
+
+/// `__gpuix_url_parse(url, base?)`: the `url` crate's parse, or null when invalid.
+fn url_parse<'js>(ctx: Ctx<'js>, url: String, base: Opt<Option<String>>) -> Result<Value<'js>> {
+    let parsed = match base.0.flatten() {
+        Some(base) => http_client::Url::parse(&base).and_then(|base| base.join(&url)),
+        None => http_client::Url::parse(&url),
+    };
+    let Ok(parsed) = parsed else { return Ok(Value::new_null(ctx)) };
+    let object = Object::new(ctx.clone())?;
+    object.set("href", parsed.as_str())?;
+    object.set("origin", parsed.origin().ascii_serialization())?;
+    object.set("protocol", format!("{}:", parsed.scheme()))?;
+    object.set("username", parsed.username())?;
+    object.set("password", parsed.password().unwrap_or(""))?;
+    object.set("hostname", parsed.host_str().unwrap_or(""))?;
+    object.set("port", parsed.port().map(|port| port.to_string()).unwrap_or_default())?;
+    object.set(
+        "host",
+        match (parsed.host_str(), parsed.port()) {
+            (Some(host), Some(port)) => format!("{host}:{port}"),
+            (Some(host), None) => host.to_string(),
+            _ => String::new(),
+        },
+    )?;
+    object.set("pathname", parsed.path())?;
+    object.set("search", parsed.query().map(|query| format!("?{query}")).unwrap_or_default())?;
+    object.set("hash", parsed.fragment().map(|fragment| format!("#{fragment}")).unwrap_or_default())?;
+    Ok(object.into_value())
+}
+
+/// `__gpuix_open_url(url)`: the platform's opener, detached; a missing one is
+/// reported, not thrown, since the click that asked has already been handled.
+fn open_url(url: String) {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(&url);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", "", &url]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(&url);
+        command
+    };
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    if let Err(error) = command.spawn() {
+        eprintln!("[gpuix-qjs] could not open {url}: {error}");
+    }
+}
+
+fn utf8_encode<'js>(ctx: Ctx<'js>, text: String) -> Result<TypedArray<'js, u8>> {
+    TypedArray::new(ctx, text.into_bytes())
+}
+
+fn utf8_decode<'js>(ctx: Ctx<'js>, data: Value<'js>) -> Result<String> {
+    Ok(String::from_utf8_lossy(&bytes(&ctx, data)?).into_owned())
+}
 
 fn install_globals(ctx: &Ctx<'_>, argv: &[String]) -> Result<()> {
     let globals = ctx.globals();
@@ -902,6 +1102,12 @@ fn install_globals(ctx: &Ctx<'_>, argv: &[String]) -> Result<()> {
     info.set("versions", versions)?;
     globals.set("__gpuix_process", info)?;
 
+    globals.set("__gpuix_fetch", Func::from(fetch))?;
+    globals.set("__gpuix_url_parse", Func::from(url_parse))?;
+    globals.set("__gpuix_utf8_encode", Func::from(utf8_encode))?;
+    globals.set("__gpuix_utf8_decode", Func::from(utf8_decode))?;
+    globals.set("__gpuix_open_url", Func::from(open_url))?;
+
     ctx.eval::<(), _>(PRELUDE)
 }
 
@@ -932,26 +1138,22 @@ fn import(context: &Context, specifier: &str) -> bool {
     })
 }
 
-fn watch_stdin(enabled: bool) -> Receiver<()> {
-    let (tx, rx) = mpsc::channel();
-    if !enabled {
-        return rx;
-    }
+fn watch_stdin(waker: mpsc::Sender<Wake>) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             match line {
                 Ok(line) if line.trim() == "reload" => {
-                    if tx.send(()).is_err() {
-                        break;
+                    if waker.send(Wake::Reload).is_err() {
+                        return;
                     }
                 }
                 Ok(_) => {}
                 Err(_) => break,
             }
         }
+        let _ = waker.send(Wake::StdinClosed);
     });
-    rx
 }
 
 const USAGE: &str = "usage: gpuix-qjs <bundle.js> [args]\n       gpuix-qjs --pack <dir> --entry <file> --out <executable>\n       gpuix-qjs --version";
@@ -1014,56 +1216,59 @@ fn main() {
         std::process::exit(1);
     }
 
+    let (waker, wakes) = mpsc::channel();
+    WAKER.set(waker.clone()).ok().expect("one main");
     // A packed app has no dev server on its stdin, and may have no stdin at all.
-    let reloads = watch_stdin(!packed);
     let mut stdin_open = !packed;
+    if stdin_open {
+        watch_stdin(waker);
+    }
     let mut version = 0u32;
-    let reload = |version: &mut u32| {
-        *version += 1;
-        let specifier = format!("{entry}?v={version}");
-        eprintln!("[gpuix-qjs] reloading ({specifier})");
-        import(&context, &specifier);
+    let mut handle = |wake: Wake, stdin_open: &mut bool| match wake {
+        Wake::Reload => {
+            version += 1;
+            let specifier = format!("{entry}?v={version}");
+            eprintln!("[gpuix-qjs] reloading ({specifier})");
+            import(&context, &specifier);
+        }
+        Wake::StdinClosed => *stdin_open = false,
+        // Settled at the top of the next turn.
+        Wake::Completion => {}
     };
 
     loop {
         context.with(|ctx| {
             run_due_timers(&ctx);
+            settle_completions(&ctx);
             drain_jobs(&ctx);
         });
-        while stdin_open {
-            match reloads.try_recv() {
-                Ok(()) => reload(&mut version),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => stdin_open = false,
-            }
+        while let Ok(wake) = wakes.try_recv() {
+            handle(wake, &mut stdin_open);
         }
 
         let next = TIMERS.with(|timers| timers.borrow().next_deadline());
-        let pending_jobs = runtime.is_job_pending();
+        let ready = runtime.is_job_pending() || completions_pending();
         match next {
             Some(deadline) => {
                 let wait = deadline.saturating_duration_since(Instant::now());
-                if wait.is_zero() || pending_jobs {
+                if wait.is_zero() || ready {
                     continue;
                 }
-                if stdin_open {
-                    match reloads.recv_timeout(wait) {
-                        Ok(()) => reload(&mut version),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => stdin_open = false,
-                    }
-                } else {
-                    std::thread::sleep(wait);
+                match wakes.recv_timeout(wait) {
+                    Ok(wake) => handle(wake, &mut stdin_open),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => unreachable!("WAKER keeps a sender"),
                 }
             }
-            None if pending_jobs => continue,
+            None if ready => continue,
             None => {
-                // Nothing scheduled: only a reload could make the app do anything.
-                if !stdin_open {
+                // Nothing scheduled and nothing in flight: only a reload could make
+                // the app do anything, and a closed stdin rules that out too.
+                if !settlers_waiting() && !stdin_open {
                     break;
                 }
-                match reloads.recv() {
-                    Ok(()) => reload(&mut version),
+                match wakes.recv() {
+                    Ok(wake) => handle(wake, &mut stdin_open),
                     Err(_) => break,
                 }
             }

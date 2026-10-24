@@ -25,6 +25,14 @@ gpuix-qjs --version
   `process` (`env`, `argv`, `platform` in Node's spelling, `exit`, `cwd`, `stdout`/`stderr.write`,
   `nextTick`, `versions.quickjs`), and polyfills of `queueMicrotask` and `structuredClone` where
   the engine lacks them. `performance.now` is QuickJS-ng's own.
+- Web APIs an app reaches for, written once in `src/prelude.js` over four natives: `fetch` with
+  `Headers`/`Request`/`Response` (whole bodies, no streams, `AbortSignal` accepted and ignored)
+  through zed's `reqwest_client`, which `gpuix-native` already links for `<img src="https://…">`,
+  so it adds no second HTTP or TLS stack; `URL`/`URLSearchParams` over the `url` crate's parser;
+  UTF-8 `TextEncoder`/`TextDecoder`; and `globalThis.gpuixHost.openUrl(url)`, the platform's
+  browser opener, under the one name an app can test for (`gpuixHost.runtime === 'quickjs'`).
+  Background threads settle their promises through a completion queue the main loop drains, and
+  wake it through the same channel stdin's `reload` uses.
 - Module loading from disk by absolute path, relative specifiers resolved against the importer. A
   `?query` is part of a module's identity, which is how a dev server's `?v=N` re-import gets a
   fresh instance of the app while its unchanged chunks stay cached.

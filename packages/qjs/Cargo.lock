@@ -2678,8 +2678,11 @@ dependencies = [
 name = "gpuix-qjs"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpuix-native",
+ "http_client",
  "napi",
+ "reqwest_client",
  "rquickjs",
  "serde",
  "serde_json",

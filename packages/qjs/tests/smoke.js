@@ -14,6 +14,18 @@ check('relative import', helper() === 'helper-ok');
 check('process', ['darwin', 'linux', 'win32'].includes(process.platform) && typeof process.versions.quickjs === 'string' && typeof process.env === 'object');
 check('globals', [queueMicrotask, performance.now, structuredClone, setTimeout, setInterval, clearTimeout].every((f) => typeof f === 'function'));
 
+const url = new URL('https://user:pw@news.ycombinator.com:8443/item?id=1&x=y#top');
+check('URL parts', url.hostname === 'news.ycombinator.com' && url.port === '8443' && url.pathname === '/item' && url.search === '?id=1&x=y' && url.hash === '#top' && url.origin === 'https://news.ycombinator.com:8443');
+check('URL relative + searchParams', new URL('../b?q=1', 'https://a.test/x/y/z').href === 'https://a.test/x/b?q=1' && url.searchParams.get('x') === 'y' && URL.canParse('nope') === false);
+const bytes = new TextEncoder().encode('héllo €');
+check('TextEncoder/TextDecoder round trip', bytes.length === 10 && new TextDecoder().decode(bytes) === 'héllo €');
+const headers = new Headers({ 'Content-Type': 'text/plain' });
+headers.append('x-a', '1');
+headers.append('X-A', '2');
+check('Headers are case-insensitive and append joins', headers.get('content-type') === 'text/plain' && headers.get('x-a') === '1, 2' && [...headers].length === 2);
+check('Response.json', await Response.json({ a: 1 }).json().then((v) => v.a === 1) && new Response('x', { status: 404 }).ok === false);
+check('fetch exists and rejects a bad scheme', typeof fetch === 'function' && (await fetch('nope://x').then(() => false, (e) => e instanceof Error)));
+
 const r = new GpuixRenderer((err, event) => console.log('event', err, event));
 check('requiresTick before init', r.requiresTick() === true && r.isInitialized() === false);
 let threw = '';

@@ -16,8 +16,14 @@ gpuix-native = { path = "../native" }
 rquickjs = { version = "0.14", features = ["loader", "macro", "classes", "array-buffer"] }
 serde = "1"
 serde_json = "1"
+futures = "0.3"
 # Only for the error type gpuix-native's methods return; nothing here calls Node-API.
 napi = "3"
+# `fetch` goes through the HTTP client gpuix-native already links for `<img src="https://…">`,
+# so it adds no second HTTP or TLS stack. `http_client` also re-exports the `url` crate
+# behind the JS `URL`.
+http_client = { path = "../../zed/crates/http_client" }
+reqwest_client = { path = "../../zed/crates/reqwest_client" }
 
 [profile.release]
 lto = true
