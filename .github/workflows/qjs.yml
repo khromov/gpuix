@@ -1,0 +1,131 @@
+name: gpuix-qjs
+# Builds the QuickJS host (packages/qjs) for every platform on pushes that touch it,
+# and publishes the per-platform npm packages from a `gpuix-qjs@<version>` tag.
+"on":
+  push:
+    branches:
+      - main
+    tags:
+      - "gpuix-qjs@*"
+    paths:
+      - packages/qjs/**
+      - packages/native/src/**
+      - packages/native/Cargo.toml
+      - .github/workflows/qjs.yml
+  pull_request:
+    paths:
+      - packages/qjs/**
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            binary: gpuix-qjs
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: gpuix-qjs
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: gpuix-qjs.exe
+    name: build - ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    defaults:
+      run:
+        working-directory: packages/qjs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Reads the channel from rust-toolchain.toml, which must match zed's pin.
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.settings.target }}
+          cache: false
+          rustflags: ""
+
+      # gpui_apple compiles its shaders with `metal`, which Xcode no longer ships by default.
+      - name: Install Metal toolchain
+        if: contains(matrix.settings.target, 'apple-darwin')
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/native/target/
+          key: ${{ matrix.settings.target }}-qjs-${{ hashFiles('packages/qjs/Cargo.lock', 'packages/native/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.settings.target }}-qjs-
+            ${{ matrix.settings.target }}-cargo-
+
+      # Same system deps as ci.yml's native build (Vulkan, Wayland, X11, fonts).
+      - name: Install Linux dependencies
+        if: contains(matrix.settings.target, 'linux')
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            gcc g++ clang \
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libx11-xcb-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan1 \
+            vulkan-validationlayers
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --target ${{ matrix.settings.target }}
+
+      - name: Smoke test
+        shell: bash
+        run: ../native/target/${{ matrix.settings.target }}/release/${{ matrix.settings.binary }} --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpuix-qjs-${{ matrix.settings.target }}
+          path: packages/native/target/${{ matrix.settings.target }}/release/${{ matrix.settings.binary }}
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/gpuix-qjs@')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble and publish
+        working-directory: packages/qjs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#gpuix-qjs@}"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            binary=gpuix-qjs; [[ $target == *windows* ]] && binary=gpuix-qjs.exe
+            node npm/make.mjs "$target" "$version" "../../artifacts/gpuix-qjs-$target/$binary"
+          done
+          for dir in npm/gpuix-qjs-*/; do
+            (cd "$dir" && npm publish --access public --provenance)
+          done

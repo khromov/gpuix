@@ -87,10 +87,32 @@ pub(crate) fn parse_font_weight(value: &crate::style::FontWeightValue) -> gpui::
 }
 
 /// Abstracted event callback shared by desktop, browser, and test renderers.
+/// Public so a host that embeds this crate without napi can hand one to
+/// `GpuixRenderer::with_event_callback`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type EventCallback = Arc<dyn Fn(EventPayload) + Send + Sync>;
+pub type EventCallback = Arc<dyn Fn(EventPayload) + Send + Sync>;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-pub(crate) type EventCallback = Rc<dyn Fn(EventPayload)>;
+pub type EventCallback = Rc<dyn Fn(EventPayload)>;
+
+/// Where a path prompt's answer goes. napi wraps a `JsDeferred` in one; a
+/// non-napi host passes its own closure.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub struct PathPromptSink(Box<dyn FnOnce(Result<Option<Vec<String>>>) + Send>);
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl PathPromptSink {
+    pub fn new(done: impl FnOnce(Result<Option<Vec<String>>>) + Send + 'static) -> Self {
+        Self(Box::new(done))
+    }
+
+    fn settle(self, result: Result<Option<Vec<String>>>) {
+        (self.0)(result)
+    }
+
+    fn reject(self, error: Error) {
+        self.settle(Err(error))
+    }
+}
 
 fn raw_dimension_u32(value: f64, label: &str) -> std::result::Result<u32, String> {
     if !value.is_finite() || value <= 0.0 || value.fract() != 0.0 || value > u32::MAX as f64 {
@@ -442,7 +464,7 @@ enum UiCommand {
     SetWindowTitle(String),
     PromptForPaths {
         options: gpui::PathPromptOptions,
-        deferred: PathPromptDeferred,
+        sink: PathPromptSink,
     },
     SetDebugFrameOverlay(gpui::DebugFrameOverlayMode),
     CycleDebugFrameOverlay {
@@ -576,10 +598,10 @@ async fn run_ui_commands(
                 cx.notify();
                 window.refresh();
             }),
-            UiCommand::PromptForPaths { options, deferred } => {
+            UiCommand::PromptForPaths { options, sink } => {
                 let background_executor = cx.background_executor().clone();
                 let receiver = cx.update(|cx| cx.prompt_for_paths(options));
-                settle_path_prompt(background_executor, receiver, deferred);
+                settle_path_prompt(background_executor, receiver, sink);
                 Ok(())
             }
             UiCommand::SetDebugFrameOverlay(mode) => {
@@ -961,7 +983,7 @@ pub fn is_terminal() -> bool {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[napi]
 pub struct GpuixRenderer {
-    event_callback: Mutex<Option<Arc<ThreadsafeFunction<EventPayload>>>>,
+    event_callback: Mutex<Option<EventCallback>>,
     tree: Arc<Mutex<RetainedTree>>,
     initialized: Arc<Mutex<bool>>,
     /// Shared with GpuixView so napi methods can read the live selection
@@ -981,11 +1003,7 @@ pub struct GpuixRenderer {
 #[napi]
 impl GpuixRenderer {
     fn event_callback_for_view(&self) -> Option<EventCallback> {
-        self.event_callback.lock().unwrap().clone().map(|tsf| {
-            Arc::new(move |payload: EventPayload| {
-                tsf.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
-            }) as EventCallback
-        })
+        self.event_callback.lock().unwrap().clone()
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
@@ -999,7 +1017,7 @@ impl GpuixRenderer {
             .map_err(|_| Error::from_reason("The GPUI UI thread is not running"))
     }
 
-    fn begin_path_prompt(&self, options: gpui::PathPromptOptions, deferred: PathPromptDeferred) {
+    fn begin_path_prompt(&self, options: gpui::PathPromptOptions, sink: PathPromptSink) {
         #[cfg(target_os = "macos")]
         {
             let prompt = GPUI_APP.with(|app| {
@@ -1016,9 +1034,9 @@ impl GpuixRenderer {
             });
             match prompt {
                 Ok((background_executor, receiver)) => {
-                    settle_path_prompt(background_executor, receiver, deferred)
+                    settle_path_prompt(background_executor, receiver, sink)
                 }
-                Err(error) => deferred.reject(error),
+                Err(error) => sink.reject(error),
             }
             return;
         }
@@ -1026,19 +1044,18 @@ impl GpuixRenderer {
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         {
             if !self.ui_running.load(Ordering::Acquire) {
-                deferred.reject(Error::from_reason("The GPUI UI thread is not running"));
+                sink.reject(Error::from_reason("The GPUI UI thread is not running"));
                 return;
             }
             let sender = self.ui_commands.lock().unwrap().as_ref().cloned();
             let Some(sender) = sender else {
-                deferred.reject(Error::from_reason("GPUI application is not initialized"));
+                sink.reject(Error::from_reason("GPUI application is not initialized"));
                 return;
             };
-            if let Err(error) =
-                sender.unbounded_send(UiCommand::PromptForPaths { options, deferred })
+            if let Err(error) = sender.unbounded_send(UiCommand::PromptForPaths { options, sink })
             {
-                if let UiCommand::PromptForPaths { deferred, .. } = error.into_inner() {
-                    deferred.reject(Error::from_reason("The GPUI UI thread is not running"));
+                if let UiCommand::PromptForPaths { sink, .. } = error.into_inner() {
+                    sink.reject(Error::from_reason("The GPUI UI thread is not running"));
                 }
             }
             return;
@@ -1052,7 +1069,7 @@ impl GpuixRenderer {
         )))]
         {
             let _ = options;
-            deferred.reject(Error::from_reason("Unsupported operating system"));
+            sink.reject(Error::from_reason("Unsupported operating system"));
         }
     }
 
@@ -1172,9 +1189,19 @@ impl GpuixRenderer {
 
     #[napi(constructor)]
     pub fn new(event_callback: Option<ThreadsafeFunction<EventPayload>>) -> Self {
+        Self::with_event_callback(event_callback.map(|tsf| {
+            Arc::new(move |payload: EventPayload| {
+                tsf.call(Ok(payload), ThreadsafeFunctionCallMode::NonBlocking);
+            }) as EventCallback
+        }))
+    }
+
+    /// The constructor for a host that is not Node: events go to a plain Rust
+    /// closure, on whatever thread GPUI raises them.
+    pub fn with_event_callback(event_callback: Option<EventCallback>) -> Self {
         let _ = env_logger::try_init();
         Self {
-            event_callback: Mutex::new(event_callback.map(Arc::new)),
+            event_callback: Mutex::new(event_callback),
             tree: Arc::new(Mutex::new(RetainedTree::new())),
             initialized: Arc::new(Mutex::new(false)),
             selection: SharedSelection::default(),
@@ -1928,11 +1955,25 @@ impl GpuixRenderer {
         options: Option<PathPromptOptions>,
     ) -> Result<Object<'env>> {
         let (deferred, promise): (PathPromptDeferred, Object<'env>) = env.create_deferred()?;
-        match PathPromptOptions::to_gpui(options) {
-            Ok(options) => self.begin_path_prompt(options, deferred),
+        self.prompt_for_paths_with(options, move |result| match result {
+            Ok(paths) => deferred.resolve(Box::new(move |_env| Ok(paths))),
             Err(error) => deferred.reject(error),
-        }
+        });
         Ok(promise)
+    }
+
+    /// `promptForPaths` for a host without napi promises: `done` runs once, on
+    /// a background thread, with the chosen paths (`None` when cancelled).
+    pub fn prompt_for_paths_with(
+        &self,
+        options: Option<PathPromptOptions>,
+        done: impl FnOnce(Result<Option<Vec<String>>>) + Send + 'static,
+    ) {
+        let sink = PathPromptSink::new(done);
+        match PathPromptOptions::to_gpui(options) {
+            Ok(options) => self.begin_path_prompt(options, sink),
+            Err(error) => sink.reject(error),
+        }
     }
 
     #[napi]
@@ -2364,12 +2405,23 @@ impl GpuixRenderer {
         pixels: Buffer,
         format: Option<String>,
     ) -> Result<()> {
+        self.set_image_pixels_bytes(element_id, width, height, pixels.to_vec(), format)
+    }
+
+    /// `setImagePixels` with the bytes already copied out of the JS engine.
+    pub fn set_image_pixels_bytes(
+        &self,
+        element_id: f64,
+        width: f64,
+        height: f64,
+        bytes: Vec<u8>,
+        format: Option<String>,
+    ) -> Result<()> {
         let id = to_element_id(element_id)?;
         let width = dimension_u32(width, "width")?;
         let height = dimension_u32(height, "height")?;
         let format = crate::custom_elements::img::PixelFormat::parse(format.as_deref())
             .map_err(Error::from_reason)?;
-        let bytes = pixels.to_vec();
         #[cfg(target_os = "macos")]
         {
             return update_window(move |view, window, cx| {
@@ -2406,8 +2458,12 @@ impl GpuixRenderer {
     /// an `<img>` host node. Prefer `setImagePixels` for live waveforms.
     #[napi]
     pub fn set_image(&self, element_id: f64, bytes: Buffer) -> Result<()> {
+        self.set_image_bytes(element_id, bytes.to_vec())
+    }
+
+    /// `setImage` with the bytes already copied out of the JS engine.
+    pub fn set_image_bytes(&self, element_id: f64, bytes: Vec<u8>) -> Result<()> {
         let id = to_element_id(element_id)?;
-        let bytes = bytes.to_vec();
         #[cfg(target_os = "macos")]
         {
             return update_window(move |view, window, cx| {
@@ -2443,7 +2499,11 @@ impl GpuixRenderer {
     /// exist then has already fallen back to another font.
     #[napi]
     pub fn register_font(&self, data: Buffer) -> Result<()> {
-        let bytes = data.to_vec();
+        self.register_font_bytes(data.to_vec())
+    }
+
+    /// `registerFont` with the bytes already copied out of the JS engine.
+    pub fn register_font_bytes(&self, bytes: Vec<u8>) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             return update_window(move |view, window, cx| view.register_font(bytes, window, cx))?
@@ -7231,7 +7291,7 @@ fn path_prompt_result(
 fn settle_path_prompt(
     executor: gpui::BackgroundExecutor,
     receiver: PathPromptReceiver,
-    deferred: PathPromptDeferred,
+    sink: PathPromptSink,
 ) {
     executor
         .spawn(async move {
@@ -7239,15 +7299,13 @@ fn settle_path_prompt(
                 .await
                 .map_err(|_| Error::from_reason("The path prompt closed without a result"))
                 .and_then(path_prompt_result);
-            match result {
-                Ok(paths) => deferred.resolve(Box::new(move |_env| Ok(paths))),
-                Err(error) => deferred.reject(error),
-            }
+            sink.settle(result);
         })
         .detach();
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct PathPromptOptions {
     /// Select files. Defaults to true unless `directories` is true.
@@ -7320,14 +7378,14 @@ impl Task for PromptForPathsTask {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct WindowSize {
     pub width: f64,
     pub height: f64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct EdgeInsets {
     pub top: f64,
@@ -7336,7 +7394,8 @@ pub struct EdgeInsets {
     pub left: f64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct WindowInsets {
     pub safe_area: EdgeInsets,
@@ -7403,7 +7462,7 @@ fn window_insets_js(
 }
 
 /// Last painted box for a host element.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct ElementBounds {
     pub x: f64,
@@ -7445,7 +7504,8 @@ fn element_bounds_js(
 
 /// Recorded draw times from the debug frame overlay.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 #[napi(object)]
 pub struct DebugFrameOverlayStats {
     pub current_ms: Option<f64>,
@@ -7462,7 +7522,8 @@ pub struct DebugFrameOverlayStats {
 /// wallpaper) with no native titlebar instead of a normal floating window.
 /// `width` / `height` then only constrain the axis the surface is not
 /// stretched along by its `anchor`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct LayerShellOptions {
     /// Compositor surface namespace, used for window rules. Cannot be changed
@@ -7490,7 +7551,8 @@ pub struct LayerShellOptions {
     pub keyboard_interactivity: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct WindowOptions {
     pub title: Option<String>,

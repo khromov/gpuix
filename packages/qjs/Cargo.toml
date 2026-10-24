@@ -1,0 +1,32 @@
+[package]
+name = "gpuix-qjs"
+version = "0.1.0"
+edition = "2021"
+description = "Runs a bundled GPUIX app on QuickJS-ng with the GPUI renderer linked in"
+license = "Apache-2.0"
+publish = false
+
+[[bin]]
+name = "gpuix-qjs"
+path = "src/main.rs"
+
+[dependencies]
+gpuix-native = { path = "../native" }
+# quickjs-ng is what rquickjs-sys bundles since 0.9.
+rquickjs = { version = "0.14", features = ["loader", "macro", "classes", "array-buffer"] }
+serde = "1"
+serde_json = "1"
+# Only for the error type gpuix-native's methods return; nothing here calls Node-API.
+napi = "3"
+
+[profile.release]
+lto = true
+# The host ships as-is, so drop the symbol table here rather than in a packaging step.
+strip = "symbols"
+
+# Rust's default `strip = "debuginfo"` rewrites the proc-macro dylibs with
+# rust-objcopy, which can leave their string pool 4-byte aligned, and macOS 27's
+# dyld then refuses them ("mis-aligned LINKEDIT string pool", seen as "can't
+# find crate for `rquickjs_macro`"). Fixed upstream in Rust 1.98; the zed pin is 1.97.
+[profile.release.build-override]
+strip = "none"

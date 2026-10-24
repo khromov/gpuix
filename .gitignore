@@ -16,5 +16,7 @@ examples/bundle/
 examples/idle-hello.cjs
 examples/AppIcon.icns
 tmp-icons/
+# packages/qjs/npm/make.mjs assembles the per-platform host packages here
+packages/qjs/npm/gpuix-qjs-*/
 # Test output churns every run; the curated set the README links to lives in
 # docs/images and is regenerated with `bun scripts/screenshots.ts`.

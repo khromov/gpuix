@@ -1,0 +1,4 @@
+# Share packages/native's target dir: gpui and the zed crates are the bulk of the
+# build and are identical here, so a build of one package warms the other.
+[build]
+target-dir = "../native/target"
