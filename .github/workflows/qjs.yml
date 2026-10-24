@@ -11,6 +11,7 @@ name: gpuix-qjs
       - packages/qjs/**
       - packages/native/src/**
       - packages/native/Cargo.toml
+      - packages/native/Cargo.lock
       - .github/workflows/qjs.yml
   pull_request:
     paths:
@@ -88,9 +89,13 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.settings.target }}
 
+      # tests/smoke.js opens no window, so it runs on every builder; it exits 7 on success.
       - name: Smoke test
         shell: bash
-        run: ../native/target/${{ matrix.settings.target }}/release/${{ matrix.settings.binary }} --version
+        run: |
+          host=../native/target/${{ matrix.settings.target }}/release/${{ matrix.settings.binary }}
+          "$host" --version
+          "$host" tests/smoke.js && exit 1 || test $? -eq 7
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

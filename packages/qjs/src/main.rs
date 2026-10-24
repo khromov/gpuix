@@ -63,14 +63,22 @@ thread_local! {
     static TIMERS: RefCell<Timers> = RefCell::new(Timers::default());
 }
 
+/// Node's rule: a delay that is not a finite number in `1..=2^31-1` becomes 1 ms,
+/// which also keeps `setInterval(fn, 0)` from spinning the loop.
+fn timer_delay(value: Option<Value<'_>>) -> Duration {
+    let ms = value.and_then(|value| value.as_number()).unwrap_or(1.0);
+    let ms = if ms.is_finite() && ms >= 1.0 && ms <= 2_147_483_647.0 { ms } else { 1.0 };
+    Duration::from_secs_f64(ms / 1000.0)
+}
+
 fn schedule<'js>(
     ctx: &Ctx<'js>,
     callback: Function<'js>,
-    delay: Option<f64>,
+    delay: Option<Value<'js>>,
     args: Vec<Value<'js>>,
     repeat: bool,
 ) -> u32 {
-    let delay = Duration::from_secs_f64(delay.unwrap_or(0.0).max(0.0) / 1000.0);
+    let delay = timer_delay(delay);
     TIMERS.with(|timers| {
         let mut timers = timers.borrow_mut();
         timers.next_id += 1;
@@ -88,40 +96,43 @@ fn schedule<'js>(
     })
 }
 
-fn set_timeout<'js>(ctx: Ctx<'js>, callback: Function<'js>, delay: Opt<f64>, args: Rest<Value<'js>>) -> u32 {
+// `Opt<T>` is `None` only for a missing argument; an explicit `undefined` or
+// `null` must not throw the way a typed parameter would, so these take `Value`s.
+fn set_timeout<'js>(ctx: Ctx<'js>, callback: Function<'js>, delay: Opt<Value<'js>>, args: Rest<Value<'js>>) -> u32 {
     schedule(&ctx, callback, delay.0, args.0, false)
 }
 
-fn set_interval<'js>(ctx: Ctx<'js>, callback: Function<'js>, delay: Opt<f64>, args: Rest<Value<'js>>) -> u32 {
+fn set_interval<'js>(ctx: Ctx<'js>, callback: Function<'js>, delay: Opt<Value<'js>>, args: Rest<Value<'js>>) -> u32 {
     schedule(&ctx, callback, delay.0, args.0, true)
 }
 
-fn clear_timer(id: Opt<u32>) {
-    if let Some(id) = id.0 {
-        TIMERS.with(|timers| timers.borrow_mut().active.remove(&id));
+fn clear_timer(id: Opt<Value<'_>>) {
+    if let Some(id) = id.0.and_then(|value| value.as_number()) {
+        TIMERS.with(|timers| timers.borrow_mut().active.remove(&(id as u32)));
     }
 }
 
 /// One pass over the timers due now. Only those: a callback that schedules a
 /// 0 ms timer (the frame loop after a slow frame does) runs it next pass, after
-/// the jobs and reloads in between, rather than starving them.
+/// the jobs and reloads in between, rather than starving them. Each timer is
+/// taken out of the table at its own turn, so a `clearTimeout` from an earlier
+/// callback in the same pass still cancels it.
 fn run_due_timers(ctx: &Ctx<'_>) {
     let now = Instant::now();
-    let mut due: Vec<(u32, Timer)> = TIMERS.with(|timers| {
-        let mut timers = timers.borrow_mut();
-        let ids: Vec<u32> = timers
+    let mut due: Vec<(Instant, u32)> = TIMERS.with(|timers| {
+        timers
+            .borrow()
             .active
             .iter()
             .filter(|(_, timer)| timer.deadline <= now)
-            .map(|(id, _)| *id)
-            .collect();
-        ids.into_iter()
-            .filter_map(|id| timers.active.remove(&id).map(|timer| (id, timer)))
+            .map(|(id, timer)| (timer.deadline, *id))
             .collect()
     });
-    due.sort_by_key(|(_, timer)| timer.deadline);
+    due.sort();
 
-    for (id, timer) in due {
+    for (_, id) in due {
+        let Some(timer) = TIMERS.with(|timers| timers.borrow_mut().active.remove(&id)) else { continue };
+        // Re-armed before the callback, so a `clearInterval` inside it is final.
         if let Some(interval) = timer.interval {
             TIMERS.with(|timers| {
                 timers.borrow_mut().active.insert(
@@ -152,14 +163,45 @@ fn run_due_timers(ctx: &Ctx<'_>) {
 
 // ── Diagnostics ──────────────────────────────────────────────────────────
 
+/// stderr may be a closed pipe; a diagnostic must never take the app down.
+fn warn(message: impl std::fmt::Display) {
+    let _ = writeln!(std::io::stderr(), "[gpuix-qjs] {message}");
+}
+
+/// Runs pending promise jobs and reports the ones that throw. rquickjs's
+/// `Ctx::execute_pending_job` catches and drops a job's exception, which would
+/// hide every `$effect` that fails after an await (Svelte flushes them in
+/// microtasks), so this goes to the engine directly.
 fn drain_jobs(ctx: &Ctx<'_>) {
-    while ctx.execute_pending_job() {}
+    loop {
+        let mut job_ctx = std::ptr::null_mut();
+        let runtime = unsafe { rquickjs::qjs::JS_GetRuntime(ctx.as_raw().as_ptr()) };
+        let result = unsafe { rquickjs::qjs::JS_ExecutePendingJob(runtime, &mut job_ctx) };
+        if result == 0 {
+            break;
+        }
+        if result < 0 {
+            // One context per runtime here, so the pending exception is on `ctx`.
+            let value = ctx.catch();
+            warn(format!("uncaught (in promise job): {}", describe(ctx, &value)));
+        }
+    }
+    // The queue is empty, so a rejection still unhandled has nobody left to handle it.
+    for (_, reason) in REJECTIONS.with(|rejections| std::mem::take(&mut *rejections.borrow_mut())) {
+        warn(format!("unhandled promise rejection: {reason}"));
+    }
+}
+
+thread_local! {
+    /// Rejected promises nobody has handled yet, by object pointer, with the reason
+    /// already described: `drain_jobs` reports what is left once the jobs ran.
+    static REJECTIONS: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn report(ctx: &Ctx<'_>, error: Error, what: &str) {
     let caught: std::result::Result<(), CaughtError<'_>> = Err::<(), _>(error).catch(ctx);
     if let Err(caught) = caught {
-        eprintln!("[gpuix-qjs] {what}: {caught}");
+        warn(format!("{what}: {caught}"));
     }
 }
 
@@ -190,17 +232,12 @@ fn describe<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> String {
         .unwrap_or_else(|_| "<value>".to_string())
 }
 
-fn join<'js>(ctx: &Ctx<'js>, args: &[Value<'js>]) -> String {
-    args.iter().map(|value| describe(ctx, value)).collect::<Vec<_>>().join(" ")
-}
-
-fn console_out<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) {
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{}", join(&ctx, &args.0));
-}
-
-fn console_err<'js>(ctx: Ctx<'js>, args: Rest<Value<'js>>) {
-    eprintln!("{}", join(&ctx, &args.0));
+/// `None` is `null`, as the napi binding answers, not rquickjs's `undefined`.
+fn nullable<'js, T: rquickjs::IntoJs<'js>>(ctx: &Ctx<'js>, value: Option<T>) -> Result<Value<'js>> {
+    match value {
+        Some(value) => value.into_js(ctx),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
 }
 
 /// A `napi::Error` becomes the JS exception the napi binding would have thrown.
@@ -208,10 +245,24 @@ fn throw(ctx: &Ctx<'_>, error: napi::Error) -> Error {
     Exception::throw_message(ctx, &error.reason)
 }
 
+/// Absent `Option` fields are left out, as napi leaves them out, rather than
+/// arriving as `null` and defeating `{ x = 0 }` defaults in app code.
+fn strip_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, field| !field.is_null());
+            map.values_mut().for_each(strip_nulls);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nulls),
+        _ => {}
+    }
+}
+
 fn to_js<'js, T: serde::Serialize>(ctx: &Ctx<'js>, value: &T) -> Result<Value<'js>> {
-    let json = serde_json::to_string(value)
-        .map_err(|error| Exception::throw_message(ctx, &format!("serialize: {error}")))?;
-    ctx.json_parse(json)
+    let mut json =
+        serde_json::to_value(value).map_err(|error| Exception::throw_message(ctx, &format!("serialize: {error}")))?;
+    strip_nulls(&mut json);
+    ctx.json_parse(json.to_string())
 }
 
 fn from_js<'js, T: serde::de::DeserializeOwned>(ctx: &Ctx<'js>, value: Option<Value<'js>>) -> Result<Option<T>> {
@@ -290,7 +341,7 @@ impl GpuixRenderer {
         for (id, result) in results {
             let Some((resolve, reject)) = self.prompts.settlers.borrow_mut().remove(&id) else { continue };
             let outcome = match result {
-                Ok(paths) => resolve.restore(ctx)?.call::<_, ()>((paths,)),
+                Ok(paths) => resolve.restore(ctx)?.call::<_, ()>((nullable(ctx, paths)?,)),
                 Err(reason) => {
                     let error = Exception::from_message(ctx.clone(), &reason)?;
                     reject.restore(ctx)?.call::<_, ()>((error,))
@@ -430,8 +481,8 @@ impl GpuixRenderer {
         self.inner.focus_previous().map_err(|error| throw(&ctx, error))
     }
 
-    pub fn get_focused_element_id(&self, ctx: Ctx<'_>) -> Result<Option<f64>> {
-        self.inner.get_focused_element_id().map_err(|error| throw(&ctx, error))
+    pub fn get_focused_element_id<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        nullable(&ctx, self.inner.get_focused_element_id().map_err(|error| throw(&ctx, error))?)
     }
 
     pub fn focus_next_within(&self, ctx: Ctx<'_>, element_id: f64) -> Result<()> {
@@ -458,8 +509,8 @@ impl GpuixRenderer {
             .map_err(|error| throw(&ctx, error))
     }
 
-    pub fn get_selected_text(&self) -> Option<String> {
-        self.inner.get_selected_text()
+    pub fn get_selected_text<'js>(&self, ctx: Ctx<'js>) -> Result<Value<'js>> {
+        nullable(&ctx, self.inner.get_selected_text())
     }
 
     pub fn clear_selection(&self, ctx: Ctx<'_>) -> Result<()> {
@@ -476,12 +527,12 @@ impl GpuixRenderer {
             .map_err(|error| throw(&ctx, error))
     }
 
-    pub fn get_list_scroll_top(&self, ctx: Ctx<'_>, element_id: f64) -> Result<Option<Vec<f64>>> {
-        self.inner.get_list_scroll_top(element_id).map_err(|error| throw(&ctx, error))
+    pub fn get_list_scroll_top<'js>(&self, ctx: Ctx<'js>, element_id: f64) -> Result<Value<'js>> {
+        nullable(&ctx, self.inner.get_list_scroll_top(element_id).map_err(|error| throw(&ctx, error))?)
     }
 
-    pub fn get_scroll_offset(&self, ctx: Ctx<'_>, element_id: f64) -> Result<Option<Vec<f64>>> {
-        self.inner.get_scroll_offset(element_id).map_err(|error| throw(&ctx, error))
+    pub fn get_scroll_offset<'js>(&self, ctx: Ctx<'js>, element_id: f64) -> Result<Value<'js>> {
+        nullable(&ctx, self.inner.get_scroll_offset(element_id).map_err(|error| throw(&ctx, error))?)
     }
 
     pub fn scroll_into_view(&self, ctx: Ctx<'_>, element_id: f64) -> Result<()> {
@@ -614,7 +665,8 @@ fn parse_bundle(mut payload: &[u8]) -> Option<Bundle> {
     let entry_len = read_u32(&mut payload)? as usize;
     let entry = String::from_utf8(read_bytes(&mut payload, entry_len)?.to_vec()).ok()?;
     let count = read_u32(&mut payload)?;
-    let mut files = HashMap::with_capacity(count as usize);
+    // The count is untrusted bytes; each entry costs at least its two length fields.
+    let mut files = HashMap::with_capacity((count as usize).min(payload.len() / 12));
     for _ in 0..count {
         let name_len = read_u32(&mut payload)? as usize;
         let name = String::from_utf8(read_bytes(&mut payload, name_len)?.to_vec()).ok()?;
@@ -735,11 +787,33 @@ fn pack(dir: &Path, entry: &str, out: &Path) -> std::io::Result<()> {
 
 // ── Module resolution: files by absolute path, a query kept as identity ───
 
+/// The query starts at the first `?` after the last path separator, so a
+/// Windows `\\?\` prefix or a `?` in a directory name is not mistaken for one.
 fn split_query(specifier: &str) -> (&str, &str) {
-    match specifier.find('?') {
-        Some(at) => specifier.split_at(at),
+    let name_start = specifier.rfind(['/', '\\']).map(|at| at + 1).unwrap_or(0);
+    match specifier[name_start..].find('?') {
+        Some(at) => specifier.split_at(name_start + at),
         None => (specifier, ""),
     }
+}
+
+/// Lexical join for the `/$bundle/` names of a packed app, which are not paths
+/// on any platform (`Path` would make them relative on Windows).
+fn join_virtual(base: &str, relative: &str) -> String {
+    let dir = base.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let mut segments: Vec<&str> = dir.split('/').collect();
+    for segment in relative.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if segments.len() > 1 {
+                    segments.pop();
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    segments.join("/")
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -770,10 +844,16 @@ impl Resolver for FsResolver {
             return Ok(name.to_string());
         }
         let (path, query) = split_query(name);
+        let (base_path, _) = split_query(base);
+        if path.starts_with(BUNDLE_ROOT) {
+            return Ok(name.to_string());
+        }
+        if path.starts_with('.') && base_path.starts_with(BUNDLE_ROOT) {
+            return Ok(format!("{}{}", join_virtual(base_path, path), query));
+        }
         let resolved = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else if path.starts_with('.') {
-            let (base_path, _) = split_query(base);
             Path::new(base_path).parent().unwrap_or_else(|| Path::new("")).join(path)
         } else {
             return Err(Error::new_resolving_message(
@@ -936,6 +1016,12 @@ fn fetch<'js>(ctx: Ctx<'js>, url: String, init: String, body: Opt<Value<'js>>) -
     use http_client::HttpClient as _;
 
     let init: FetchInit = serde_json::from_str(&init).map_err(|error| Exception::throw_type(&ctx, &error.to_string()))?;
+    // WHATWG normalisation (spaces, non-ASCII, IDN hosts), which `http::Uri` would reject.
+    let url = match http_client::Url::parse(&url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed.to_string(),
+        Ok(parsed) => return Err(Exception::throw_type(&ctx, &format!("fetch: unsupported scheme '{}:'", parsed.scheme()))),
+        Err(error) => return Err(Exception::throw_type(&ctx, &format!("fetch: invalid URL '{url}': {error}"))),
+    };
     let body = match body.0 {
         Some(value) if !value.is_undefined() && !value.is_null() => Some(bytes(&ctx, value)?),
         _ => None,
@@ -1006,30 +1092,40 @@ fn url_parse<'js>(ctx: Ctx<'js>, url: String, base: Opt<Option<String>>) -> Resu
     Ok(object.into_value())
 }
 
-/// `__gpuix_open_url(url)`: the platform's opener, detached; a missing one is
-/// reported, not thrown, since the click that asked has already been handled.
+/// `__gpuix_open_url(url)`: the platform's browser opener, detached. Only web
+/// and mail URLs: the argument comes from app content, and `open` would launch a
+/// `file:` app bundle as readily as a page. A failure is reported, not thrown,
+/// since the click that asked has already been handled.
 fn open_url(url: String) {
+    let parsed = match http_client::Url::parse(&url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https" | "mailto") => parsed.to_string(),
+        _ => {
+            warn(format!("not opening {url:?}: only http, https and mailto URLs are opened"));
+            return;
+        }
+    };
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = std::process::Command::new("open");
-        command.arg(&url);
+        command.arg(&parsed);
         command
     };
+    // Not `cmd /C start`: cmd would interpret `&` and `%` inside the URL.
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", "", &url]);
+        let mut command = std::process::Command::new("rundll32");
+        command.args(["url.dll,FileProtocolHandler", &parsed]);
         command
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let mut command = {
         let mut command = std::process::Command::new("xdg-open");
-        command.arg(&url);
+        command.arg(&parsed);
         command
     };
     command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     if let Err(error) = command.spawn() {
-        eprintln!("[gpuix-qjs] could not open {url}: {error}");
+        warn(format!("could not open {parsed}: {error}"));
     }
 }
 
@@ -1043,15 +1139,6 @@ fn utf8_decode<'js>(ctx: Ctx<'js>, data: Value<'js>) -> Result<String> {
 
 fn install_globals(ctx: &Ctx<'_>, argv: &[String]) -> Result<()> {
     let globals = ctx.globals();
-
-    let console = Object::new(ctx.clone())?;
-    console.set("log", Func::from(console_out))?;
-    console.set("info", Func::from(console_out))?;
-    console.set("debug", Func::from(console_out))?;
-    console.set("warn", Func::from(console_err))?;
-    console.set("error", Func::from(console_err))?;
-    console.set("trace", Func::from(console_err))?;
-    globals.set("console", console)?;
 
     globals.set("setTimeout", Func::from(set_timeout))?;
     globals.set("setInterval", Func::from(set_interval))?;
@@ -1078,8 +1165,9 @@ fn install_globals(ctx: &Ctx<'_>, argv: &[String]) -> Result<()> {
 
     let info = Object::new(ctx.clone())?;
     let env = Object::new(ctx.clone())?;
-    for (key, value) in std::env::vars() {
-        env.set(key, value)?;
+    // `vars()` panics on a non-UTF-8 value; a stray byte in the environment is not the app's problem.
+    for (key, value) in std::env::vars_os() {
+        env.set(key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned())?;
     }
     info.set("env", env)?;
     info.set("argv", argv.to_vec())?;
@@ -1162,8 +1250,18 @@ fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
     argv.iter().position(|arg| arg == flag).and_then(|at| argv.get(at + 1)).map(String::as_str)
 }
 
+/// `canonicalize` on Windows answers a `\\?\C:\…` verbatim path, which the
+/// resolver's `?` split and `Path::is_absolute` both misread.
+fn plain_path(path: PathBuf) -> String {
+    let text = path.display().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => rest.to_string(),
+        _ => text,
+    }
+}
+
 fn main() {
-    let argv: Vec<String> = std::env::args().collect();
+    let argv: Vec<String> = std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()).collect();
     let packed = embedded_bundle().is_some();
     let entry = if let Some(bundle) = embedded_bundle() {
         format!("{BUNDLE_ROOT}{}", bundle.entry)
@@ -1187,7 +1285,7 @@ fn main() {
                 return;
             }
             Some(path) if !path.starts_with('-') => match std::fs::canonicalize(path) {
-                Ok(path) => path.display().to_string(),
+                Ok(path) => plain_path(path),
                 Err(error) => {
                     eprintln!("[gpuix-qjs] {path}: {error}");
                     std::process::exit(2);
@@ -1202,9 +1300,30 @@ fn main() {
 
     let runtime = Runtime::new().expect("QuickJS runtime");
     runtime.set_loader(FsResolver, FsLoader);
+    // Node prints these; silence here would hide every rejected `fetch` nobody caught.
+    // The engine reports a rejection before a `.then` written right after it has
+    // attached, then reports it handled, so the verdict waits for the job drain.
+    runtime.set_host_promise_rejection_tracker(Some(Box::new(|ctx, promise, reason, handled| {
+        let key = unsafe { rquickjs::qjs::JS_VALUE_GET_PTR(promise.as_raw()) } as usize;
+        REJECTIONS.with(|rejections| {
+            let mut rejections = rejections.borrow_mut();
+            if handled {
+                rejections.retain(|(other, _)| *other != key);
+            } else {
+                let reason = describe(&ctx, &reason);
+                rejections.push((key, reason));
+            }
+        });
+    })));
     let context = Context::full(&runtime).expect("QuickJS context");
+    // Node's shape, `[runtime, script, ...args]`: a packed app has no script path, so its
+    // virtual entry fills the slot and `argv.slice(2)` means the same thing everywhere.
+    let mut js_argv = argv.clone();
+    if packed {
+        js_argv.insert(1, entry.clone());
+    }
     if let Err(error) = context.with(|ctx| {
-        install_globals(&ctx, &argv).map_err(|error| {
+        install_globals(&ctx, &js_argv).map_err(|error| {
             report(&ctx, error, "installing globals failed");
         })
     }) {
@@ -1218,9 +1337,12 @@ fn main() {
 
     let (waker, wakes) = mpsc::channel();
     WAKER.set(waker.clone()).ok().expect("one main");
-    // A packed app has no dev server on its stdin, and may have no stdin at all.
-    let mut stdin_open = !packed;
-    if stdin_open {
+    // stdin is the dev server's reload channel and nothing else, so it is read only
+    // when `GPUIX_QJS_DEV` says one is attached: a backgrounded `gpuix-qjs app.js &`
+    // reading a terminal would be stopped with SIGTTIN, window and all.
+    let dev = !packed && std::env::var_os("GPUIX_QJS_DEV").is_some_and(|value| !value.is_empty() && value != "0");
+    let mut stdin_open = dev;
+    if dev {
         watch_stdin(waker);
     }
     let mut version = 0u32;
@@ -1228,10 +1350,15 @@ fn main() {
         Wake::Reload => {
             version += 1;
             let specifier = format!("{entry}?v={version}");
-            eprintln!("[gpuix-qjs] reloading ({specifier})");
+            warn(format!("reloading ({specifier})"));
             import(&context, &specifier);
         }
-        Wake::StdinClosed => *stdin_open = false,
+        // The dev server went away; a window it can no longer reach should not linger.
+        Wake::StdinClosed => {
+            *stdin_open = false;
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
         // Settled at the top of the next turn.
         Wake::Completion => {}
     };
@@ -1274,4 +1401,8 @@ fn main() {
             }
         }
     }
+    // Not a return: dropping the runtime with a live Persistent callback would
+    // trip QuickJS's leak assertion, and there is nothing left to clean up anyway.
+    let _ = std::io::stdout().flush();
+    std::process::exit(0);
 }

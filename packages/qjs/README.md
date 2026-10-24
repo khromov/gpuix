@@ -8,7 +8,8 @@ drives it as `gpuix-svelte --qjs`.
 
 ```bash
 cargo build --release                       # → ../native/target/release/gpuix-qjs (shared target dir)
-gpuix-qjs dist/app/main.js [args]           # run a bundle; a line `reload` on stdin re-imports it
+gpuix-qjs dist/app/main.js [args]           # run a bundle; with GPUIX_QJS_DEV=1 a line `reload` on
+                                            # stdin re-imports it and stdin closing exits
 gpuix-qjs --pack dist/app --entry main.js --out dist/myapp   # one executable with the bundle inside
 gpuix-qjs --version
 ```
@@ -21,10 +22,16 @@ gpuix-qjs --version
   takes the same `(err, event)` callback; GPUI raises events inside `tick()`'s AppKit pump into a
   queue and `tick()` delivers them before returning. `setFrameWakeCallback` answers `false`, so the
   JS frame loop stays a paced `setTimeout` chain, as on Windows.
-- Globals a GPUIX renderer uses: `console`, `setTimeout`/`setInterval` and their `clear*`,
-  `process` (`env`, `argv`, `platform` in Node's spelling, `exit`, `cwd`, `stdout`/`stderr.write`,
-  `nextTick`, `versions.quickjs`), and polyfills of `queueMicrotask` and `structuredClone` where
-  the engine lacks them. `performance.now` is QuickJS-ng's own.
+- Globals a GPUIX renderer uses: `setTimeout`/`setInterval` and their `clear*` with Node's
+  coercions (an `undefined` id or delay is fine; a delay outside `1..=2^31-1` is 1 ms; a timer
+  cleared by an earlier callback in the same pass does not run), `console` with the methods
+  Svelte's dev tracing calls (`group`, `table`, `assert`, `time`, `count`, `%c` directives
+  stripped), `process` (`env`, `argv` as `[exe, script, ...args]`, `platform` in Node's spelling,
+  `exit`, `cwd`, `stdout`/`stderr.write`, `nextTick`, `versions.quickjs`), and polyfills of
+  `queueMicrotask` and `structuredClone` where the engine lacks them. `performance.now` is
+  QuickJS-ng's own. Optional results are `null` and absent payload fields are left out, as napi
+  does. Exceptions in promise jobs and unhandled rejections are printed to stderr once the job
+  queue is empty; the app keeps running.
 - Web APIs an app reaches for, written once in `src/prelude.js` over four natives: `fetch` with
   `Headers`/`Request`/`Response` (whole bodies, no streams, `AbortSignal` accepted and ignored)
   through zed's `reqwest_client`, which `gpuix-native` already links for `<img src="https://…">`,
@@ -49,8 +56,12 @@ the binary: `gpuix-app/` next to the executable, or `../Resources/gpuix-app/` in
 
 ## Building
 
-The crate shares `packages/native`'s target directory (`.cargo/config.toml`) and its release
-profile, so a build of either warms the other. Two things the profile does on purpose:
+The crate shares `packages/native`'s target directory (`.cargo/config.toml`), and its
+`Cargo.lock` was seeded from native's so the two resolve the same dependency versions: that is
+what lets a build of either warm the other, and keeps the host's GPUI on the dependency set the
+addon is tested with (reseed it the same way after native's lockfile moves). It is its own
+workspace root, so its `[profile.release]` is its own; it mirrors native's `lto = true`. Two
+things the profile does on purpose:
 
 - `strip = "symbols"` for the final binary, with `strip = "none"` for build scripts and proc
   macros: Rust 1.97's default debuginfo stripping leaves a proc-macro dylib's string pool
