@@ -43,6 +43,21 @@ pub use element_tree::*;
 pub use renderer::*;
 pub use style::*;
 
+/// What a Rust app that embeds `GpuixView` in a window of its own must run once
+/// on its `App`, where `GpuixRenderer::init` would have: the text field key
+/// bindings and the HTTP client `<img src="https://…">` fetches through.
+pub fn init(cx: &mut gpui::App) {
+    custom_elements::input::init(cx);
+    custom_elements::img::init(cx);
+}
+
+/// The border box an element last painted, as `getElementBounds` reports it,
+/// for an embedding app answering that query itself. Read it on the UI thread:
+/// the paint records it thread-locally.
+pub fn painted_bounds(id: u64) -> Option<ElementBounds> {
+    automation::get_bounds(id).map(ElementBounds::from_painted)
+}
+
 #[cfg(any(
     test,
     not(all(

@@ -9,15 +9,10 @@
 use napi_derive::napi;
 
 /// Event payload sent back to JS when a user interacts with an element.
-#[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", target_os = "unknown"),
-    derive(serde::Serialize)
-)]
-#[cfg_attr(
-    all(target_arch = "wasm32", target_os = "unknown"),
-    serde(rename_all = "camelCase")
-)]
+// Serialized on every target: wasm hands it to JS as JSON, and so does a host
+// that embeds this crate without napi.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct EventPayload {
     /// Numeric element ID (matches the ID assigned in JS via createElement).
@@ -178,11 +173,7 @@ impl Default for EventPayload {
     }
 }
 
-#[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", target_os = "unknown"),
-    derive(serde::Serialize)
-)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct EventModifiers {
     pub shift: bool,
@@ -207,15 +198,8 @@ impl Default for EventModifiers {
 /// The rects matter: a quad never lands in `getPaintedText()`, and a match that
 /// soft-wraps must produce one box per visual row. Without the geometry the only
 /// way to assert either is a screenshot.
-#[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", target_os = "unknown"),
-    derive(serde::Serialize)
-)]
-#[cfg_attr(
-    all(target_arch = "wasm32", target_os = "unknown"),
-    serde(rename_all = "camelCase")
-)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct HighlightMatch {
     /// Numeric id of the element that painted the run.
@@ -231,11 +215,7 @@ pub struct HighlightMatch {
     pub rects: Vec<HighlightRect>,
 }
 
-#[derive(Debug, Clone)]
-#[cfg_attr(
-    all(target_arch = "wasm32", target_os = "unknown"),
-    derive(serde::Serialize)
-)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[cfg_attr(not(all(target_arch = "wasm32", target_os = "unknown")), napi(object))]
 pub struct HighlightRect {
     pub x: f64,

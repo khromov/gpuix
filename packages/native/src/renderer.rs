@@ -87,10 +87,11 @@ pub(crate) fn parse_font_weight(value: &crate::style::FontWeightValue) -> gpui::
 }
 
 /// Abstracted event callback shared by desktop, browser, and test renderers.
+/// Public so a host that embeds `GpuixView` in its own window can hand one in.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) type EventCallback = Arc<dyn Fn(EventPayload) + Send + Sync>;
+pub type EventCallback = Arc<dyn Fn(EventPayload) + Send + Sync>;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-pub(crate) type EventCallback = Rc<dyn Fn(EventPayload)>;
+pub type EventCallback = Rc<dyn Fn(EventPayload)>;
 
 fn raw_dimension_u32(value: f64, label: &str) -> std::result::Result<u32, String> {
     if !value.is_finite() || value <= 0.0 || value.fract() != 0.0 || value > u32::MAX as f64 {
@@ -572,7 +573,7 @@ async fn run_ui_commands(
                 window.update(cx, |_view, window, _cx| window.toggle_fullscreen())
             }
             UiCommand::SetWindowTitle(title) => window.update(cx, move |view, window, cx| {
-                view.window_title = title;
+                view.window_title = Some(title);
                 cx.notify();
                 window.refresh();
             }),
@@ -1276,7 +1277,12 @@ impl GpuixRenderer {
                 to_gpui_window_options(&window_options, bounds),
                 |_window, cx| {
                     cx.new(|_| {
-                        GpuixView::new(tree.clone(), callback.clone(), title, selection.clone())
+                        GpuixView::new(
+                            tree.clone(),
+                            callback.clone(),
+                            Some(title),
+                            selection.clone(),
+                        )
                     })
                 },
             ) {
@@ -1435,7 +1441,9 @@ impl GpuixRenderer {
                             let window = match cx.open_window(
                                 to_gpui_window_options(&window_options, bounds),
                                 |_window, cx| {
-                                    cx.new(|_| GpuixView::new(tree, callback, title, selection))
+                                    cx.new(|_| {
+                                        GpuixView::new(tree, callback, Some(title), selection)
+                                    })
                                 },
                             ) {
                                 Ok(window) => window,
@@ -1901,7 +1909,7 @@ impl GpuixRenderer {
     pub fn set_window_title(&self, title: String) -> Result<()> {
         #[cfg(target_os = "macos")]
         return update_window(move |view, window, cx| {
-            view.window_title = title;
+            view.window_title = Some(title);
             cx.notify();
             window.refresh();
         });
@@ -2948,7 +2956,7 @@ fn start_web_app(
                 let mut view = GpuixView::new(
                     tree,
                     Some(event_callback),
-                    "GPUIX Web".to_string(),
+                    Some("GPUIX Web".to_string()),
                     selection,
                 );
                 if let Some((key_down, key_up, event_id)) =
@@ -3155,7 +3163,7 @@ impl WebGpuixRenderer {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = setWindowTitle)]
     pub fn set_window_title(&self, title: String) -> Result<(), wasm_bindgen::JsValue> {
         update_web_window(move |view, _window, cx| {
-            view.window_title = title;
+            view.window_title = Some(title);
             cx.notify();
         })
     }
@@ -3643,10 +3651,11 @@ impl Drop for GpuixRenderer {
 
 // ── GPUI View ────────────────────────────────────────────────────────
 
-pub(crate) struct GpuixView {
+pub struct GpuixView {
     pub(crate) tree: Arc<Mutex<RetainedTree>>,
     pub(crate) event_callback: Option<EventCallback>,
-    pub(crate) window_title: String,
+    /// `None` when the view is embedded in a window another app owns.
+    pub(crate) window_title: Option<String>,
     pub(crate) window_key_down: bool,
     pub(crate) window_key_up: bool,
     pub(crate) window_key_event_id: u64,
@@ -3957,10 +3966,13 @@ fn resolve_highlight(
 }
 
 impl GpuixView {
-    pub(crate) fn new(
+    /// Public so a Rust app can render a retained tree inside its own window:
+    /// `cx.new(|_| GpuixView::new(tree, Some(callback), None, Default::default()))`
+    /// is a view like any other, fed by `apply_batch_to_tree`.
+    pub fn new(
         tree: Arc<Mutex<RetainedTree>>,
         event_callback: Option<EventCallback>,
-        window_title: String,
+        window_title: Option<String>,
         selection: SharedSelection,
     ) -> Self {
         Self {
@@ -5090,7 +5102,9 @@ impl gpui::Render for GpuixView {
     ) -> impl gpui::IntoElement {
         use gpui::IntoElement;
 
-        window.set_window_title(&self.window_title);
+        if let Some(title) = &self.window_title {
+            window.set_window_title(title);
+        }
 
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         if let Some(id) = PENDING_FOCUS_ELEMENT.with(|pending| pending.borrow_mut().take()) {

@@ -246,7 +246,7 @@ impl TestGpuixRenderer {
                     GpuixView::new(
                         tree_clone,
                         callback_clone,
-                        "GPUIX Test".to_string(),
+                        Some("GPUIX Test".to_string()),
                         selection_clone,
                     )
                 })
