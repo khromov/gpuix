@@ -459,6 +459,7 @@ enum UiCommand {
     MinimizeWindow,
     ZoomWindow,
     ToggleFullscreen,
+    StartWindowMove,
     SetWindowTitle(String),
     UpdateApp(Box<dyn FnOnce(&mut gpui::App) + Send>),
     PromptForPaths {
@@ -587,6 +588,9 @@ async fn run_ui_commands(
             UiCommand::ZoomWindow => window.update(cx, |_view, window, _cx| window.zoom_window()),
             UiCommand::ToggleFullscreen => {
                 window.update(cx, |_view, window, _cx| window.toggle_fullscreen())
+            }
+            UiCommand::StartWindowMove => {
+                window.update(cx, |_view, window, _cx| window.start_window_move())
             }
             UiCommand::SetWindowTitle(title) => window.update(cx, move |view, window, cx| {
                 view.window_title = title;
@@ -1942,6 +1946,30 @@ impl GpuixRenderer {
 
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
         return self.send_ui_command(UiCommand::ToggleFullscreen);
+
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "freebsd"
+        )))]
+        Err(Error::from_reason(
+            "The production GPUIX renderer does not support this operating system",
+        ))
+    }
+
+    /// Start a native window move, for a custom title bar. Call it while the
+    /// primary button is held, on the first mouse move after a mouse down on
+    /// the drag area. Not on the mouse down itself: the compositor takes the
+    /// pointer grab there, so double-click-to-maximize stops working.
+    /// Does nothing on Windows, where GPUI does not implement it.
+    #[napi]
+    pub fn start_window_move(&self) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        return update_window(|_view, window, _cx| window.start_window_move());
+
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+        return self.send_ui_command(UiCommand::StartWindowMove);
 
         #[cfg(not(any(
             target_os = "macos",

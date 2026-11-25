@@ -106,6 +106,14 @@ export declare class GpuixRenderer {
   zoomWindow(): void
   /** Enter or exit native fullscreen. */
   toggleFullscreen(): void
+  /**
+   * Start a native window move, for a custom title bar. Call it while the
+   * primary button is held, on the first mouse move after a mouse down on
+   * the drag area. Not on the mouse down itself: the compositor takes the
+   * pointer grab there, so double-click-to-maximize stops working.
+   * Does nothing on Windows, where GPUI does not implement it.
+   */
+  startWindowMove(): void
   setWindowTitle(title: string): void
   /**
    * Post an OS notification. A tag that matches an earlier one replaces it
